@@ -4,67 +4,99 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 
-
 class CAPM:
-
-    def __init__(self, stocks, start_date, end_date):
+    def __init__(self, stocks, market, start_date, end_date, risk_free_rate):
         self.data = None
         self.stocks = stocks
+        self.market = market
         self.start_date = start_date
         self.end_date = end_date
+        self.risk_free_rate = risk_free_rate
 
     def download_data(self):
 
+        tickers = self.stocks + [self.market]
         data = {}
+        for ticker in tickers:
+            t = yf.Ticker(ticker)
+            data[ticker] = t.history(start=self.start_date, end=self.end_date)['Close']
 
-        for stock in self.stocks:
-            ticker = yf.Ticker(stock)
-            data[stock] = ticker.history(start=self.start_date, end=self.end_date)['Close']
+        df  = pd.DataFrame(data)
+        df.index = df.index.tz_localize(None)
 
-        return pd.DataFrame(data)
-
+        return df.dropna()
 
     def initialize(self):
-        stock_data = self.download_data()
+        price_data = self.download_data()
+        price_data = price_data.resample('ME').last()
+        log_returns = np.log(price_data / price_data.shift(1))
+        self.data = log_returns[1:]
 
-        #we take monthly returns into account,So modifying the data accordingly
-        stock_data = stock_data.resample('ME').last()
+    def run_capm(self):
+        market_returns = self.data[self.market]
+        expected_market_return = market_returns.mean() * 12
 
-        self.data = pd.DataFrame({'s_close': stock_data[self.stocks[0]], 'm_close': stock_data[self.stocks[1]]})
-        #calculating log returns
-        self.data[['s_returns', 'm_returns']] = np.log(self.data[['s_close', 'm_close']]/
-                                                 self.data[['s_close', 'm_close']].shift(1))
-        #Removing the NaN values
-        self.data = self.data[1:]
+        results = {}
+        for stock in self.stocks:
+            stock_returns = self.data[stock]
 
-    def calculate_beta(self):
-        #we need covariance matrix to calculate beta
-        covariance_matrix = np.cov(self.data['s_returns'], self.data['m_returns'])
-        #calculating beta from the formula
-        beta = covariance_matrix[0,1]/ covariance_matrix[1,1]
-        print('Beta from the formula :', beta)
+            combined = pd.concat([stock_returns, market_returns], axis=1).dropna()
+            if combined.empty or len(combined) < 12:
+                print(f"Warning: insufficient overlapping data for {stock}, skipping")
+                continue
 
-    def regression(self):
-        lr = LinearRegression()
-        lr.fit(self.data['m_returns'].values.reshape(-1, 1), self.data['s_returns'].values)
-        print('Beta from regression:', lr.coef_)
-        self.plot_graph(lr.intercept_, lr.coef_)
+            s_ret = combined[stock]
+            m_ret = combined[self.market]
 
-    def plot_graph(self, alpha, beta):
-        fig, axis = plt.subplots(1, figsize=(10,6))
-        axis.scatter(x= self.data['m_returns'], y= self.data['s_returns'])
-        axis.plot(self.data['m_returns'], beta* self.data['m_returns'] + alpha)
-        plt.title('CAPM model, Finding Alpha and Beta')
+            covariance_matrix = np.cov(s_ret, m_ret)
+            beta = covariance_matrix[0, 1] / covariance_matrix[1, 1]
+
+            lr = LinearRegression()
+            lr.fit(m_ret.values.reshape(-1, 1), s_ret.values)
+            alpha = lr.intercept_
+            beta_regression = lr.coef_[0]
+            expected_return = self.risk_free_rate + beta * (expected_market_return - self.risk_free_rate)
+            beta_diff = abs(beta - beta_regression)
+
+            results[stock] = {
+                'beta': beta,
+                'beta_regression': beta_regression,
+                'beta_diff': beta_diff,
+                'alpha': alpha,
+                'expected_return': expected_return
+            }
+
+        return results
+
+    def plot_graph(self, stock, alpha, beta):
+        stock_returns = self.data[stock]
+        market_returns = self.data[self.market]
+
+        fig, axis = plt.subplots(1, figsize=(6, 6))
+        axis.scatter(x=market_returns, y=stock_returns)
+        axis.plot(market_returns, beta * market_returns + alpha, color='red')
+        axis.grid()
+        axis.set_aspect('equal')
+        plt.title(f'CAPM: {stock} vs {self.market}')
         plt.xlabel('Market Returns')
-        plt.ylabel('Expected return')
+        plt.ylabel(f'{stock} Returns')
         plt.show()
 
-
-
 if __name__ == '__main__':
+    nifty50_stocks = ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'ICICIBANK.NS',
+                    'HINDUNILVR.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'KOTAKBANK.NS']
+    market_index = '^NSEI'
+    risk_free_rate = 0.07
 
-    capm = CAPM(['IBM', '^GSPC'], '2015-01-01', '2025-01-01')
+    capm = CAPM(nifty50_stocks, market_index, '2015-01-01', '2025-01-01', risk_free_rate)
     capm.initialize()
-    capm.calculate_beta()
-    capm.regression()
-    
+    results = capm.run_capm()
+
+    for stock, metrics in results.items():
+        print(f"{stock}: beta_cov={metrics['beta']:.4f}, beta_reg={metrics['beta_regression']:.4f}, "
+            f"diff={metrics['beta_diff']:.6f}, alpha={metrics['alpha']:.4f}, "
+            f"expected_return={metrics['expected_return']:.4f}")
+
+        capm.plot_graph(stock, results[stock]['alpha'], results[stock]['beta_regression'])
+
+    # capm.plot_graph('RELIANCE.NS', results['RELIANCE.NS']['alpha'], results['RELIANCE.NS']['beta_regression'])
